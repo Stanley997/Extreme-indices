@@ -1,5 +1,5 @@
 # ============================================================
-# FULL CLEAN SCRIPT (Python) - Persistence (Recommended Fix Applied)
+# FULL CLEAN SCRIPT (Python) - Compute-only (Plotting handled in R)
 #
 # TASKS:
 # PAPER 1
@@ -23,6 +23,9 @@
 # - rechunk flag time dimension to a single chunk before apply_ufunc:
 #   flag.chunk({"time": -1})
 #   This resolves the ValueError you hit.
+# ------------------------------------------------------------
+# Plotting:
+# - Use the companion R script `plot_unprecedented_outputs.R` to generate maps.
 # ============================================================
 
 from __future__ import annotations
@@ -30,9 +33,7 @@ from __future__ import annotations
 import numpy as np
 import xarray as xr
 import xclim as xc
-import matplotlib.pyplot as plt
 import pandas as pd
-from matplotlib.colors import BoundaryNorm, Normalize
 
 
 # -----------------------
@@ -64,11 +65,6 @@ PLOT_INDEX = "rx1day"  # "rx1day" | "rx5day" | "cdd"
 
 FORCE_PR_CONVERSION = False
 IMPOSSIBLE_MM_DAY_Q99 = 1000.0
-
-# Plot colors (your rule)
-NO_DATA_COLOR = "#ffffff"   # white
-NO_CHANGE_COLOR = "#bdbdbd" # grey
-EPS = 1e-6                  # tiny positive -> maps 0 to "under" grey
 
 # Magnitude (z-score) scaling
 Z_VMAX_PERCENTILE = 99.0   # shared vmax across SSPs (robust to outliers)
@@ -190,57 +186,17 @@ def frequency_after_emergence(flag: xr.DataArray, foe_year: xr.DataArray) -> xr.
     return (flag & after).sum("time").astype("int16")
 
 
-def cumulative_curve(foe_year_2d: xr.DataArray, start=2015, end=2100):
-    y = foe_year_2d.values
-    total = y.size
-    years = np.arange(start, end + 1, dtype=int)
-    pct = np.empty_like(years, dtype=float)
-    for i, yr in enumerate(years):
-        pct[i] = 100.0 * np.sum(np.isfinite(y) & (y <= yr)) / total
-    return years, pct
-
-
-def _infer_lonlat_names(da: xr.DataArray) -> tuple[str, str]:
-    lon_candidates = ["lon", "longitude", "x"]
-    lat_candidates = ["lat", "latitude", "y"]
-    lon = next((c for c in lon_candidates if c in da.coords), None)
-    lat = next((c for c in lat_candidates if c in da.coords), None)
-    if lon is None or lat is None:
-        raise ValueError(f"Could not find lon/lat coords. Found: {list(da.coords)}")
-    return lon, lat
-
-
-def _add_bottom_colorbar(fig, mappable, label: str, ticks=None, ticklabels=None):
-    cax = fig.add_axes([0.20, 0.06, 0.60, 0.03])
-    cbar = fig.colorbar(mappable, cax=cax, orientation="horizontal", ticks=ticks)
-    if ticklabels is not None:
-        cbar.set_ticklabels(ticklabels)
-    cbar.set_label(label)
-    return cbar
-
-
-def plot_pair_bottom_cbar(da370, da585, title, cmap, norm, cbar_label, ticks=None, ticklabels=None):
-    d1 = da370.squeeze()
-    d2 = da585.squeeze()
-    lonc, latc = _infer_lonlat_names(d1)
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharex=True, sharey=True)
-
-    m1 = axes[0].pcolormesh(d1[lonc].values, d1[latc].values, d1.values,
-                           shading="auto", cmap=cmap, norm=norm)
-    axes[0].set_title("SSP370")
-    axes[0].set_xlabel("Longitude")
-    axes[0].set_ylabel("Latitude")
-
-    m2 = axes[1].pcolormesh(d2[lonc].values, d2[latc].values, d2.values,
-                           shading="auto", cmap=cmap, norm=norm)
-    axes[1].set_title("SSP585")
-    axes[1].set_xlabel("Longitude")
-
-    fig.suptitle(title, y=0.98)
-    fig.tight_layout(rect=[0, 0.10, 1, 0.95])
-    _add_bottom_colorbar(fig, m2, cbar_label, ticks=ticks, ticklabels=ticklabels)
-    plt.show()
+def _report_zscale(zmag_370: xr.DataArray, zmag_585: xr.DataArray) -> float:
+    finite_z = np.concatenate(
+        [
+            zmag_370.values[np.isfinite(zmag_370.values)],
+            zmag_585.values[np.isfinite(zmag_585.values)],
+        ]
+    )
+    if finite_z.size == 0:
+        return Z_VMAX_FLOOR
+    z_vmax = float(np.nanpercentile(finite_z, Z_VMAX_PERCENTILE))
+    return max(z_vmax, Z_VMAX_FLOOR)
 
 
 # -----------------------
@@ -344,15 +300,7 @@ z_585 = ((fut_585 - hist_mean) / hist_std_safe).where(flag_585, 0.0)
 zmag_370 = z_370.max("time", skipna=True).astype("float32").compute()
 zmag_585 = z_585.max("time", skipna=True).astype("float32").compute()
 
-finite_z = np.concatenate([
-    zmag_370.values[np.isfinite(zmag_370.values)],
-    zmag_585.values[np.isfinite(zmag_585.values)],
-])
-if finite_z.size == 0:
-    z_vmax = Z_VMAX_FLOOR
-else:
-    z_vmax = float(np.nanpercentile(finite_z, Z_VMAX_PERCENTILE))
-    z_vmax = max(z_vmax, Z_VMAX_FLOOR)
+z_vmax = _report_zscale(zmag_370, zmag_585)
 
 # -----------------------
 # PAPER 2: Persistence (RECOMMENDED FIX: rechunk time to one chunk)
@@ -363,6 +311,15 @@ flag_585_1c = flag_585.chunk({"time": -1})
 
 persist_370 = persistence_longest_run(flag_370_1c).compute()
 persist_585 = persistence_longest_run(flag_585_1c).compute()
+
+finite_p = np.concatenate(
+    [
+        persist_370.values[np.isfinite(persist_370.values)],
+        persist_585.values[np.isfinite(persist_585.values)],
+    ]
+)
+p_vmax = float(np.nanmax(finite_p)) if finite_p.size else 1.0
+p_vmax = max(p_vmax, 1.0)
 
 # Keep frequency-after-emergence too (useful)
 freq_after_370 = frequency_after_emergence(flag_370, foe_year_370).compute()
@@ -409,86 +366,22 @@ out = xr.Dataset(
         "freq_after_emergence_ssp585": freq_after_585,
     }
 )
+out.attrs.update(
+    {
+        "z_vmax_percentile": Z_VMAX_PERCENTILE,
+        "z_vmax_floor": Z_VMAX_FLOOR,
+        "z_vmax": float(z_vmax),
+        "persistence_vmax": float(p_vmax),
+    }
+)
 encoding = {v: {"zlib": True, "complevel": 4} for v in out.data_vars}
 out.to_netcdf(OUT_NC, encoding=encoding)
 print(f"✅ Wrote: {OUT_NC}")
 
-# -----------------------
-# PLOTS
-# -----------------------
-print("\nPLOTS:")
-
-# 1) First emergence decade (Spectral_r)
-bins_dec = np.arange(2010, 2110, 10)
-ticks_dec = np.arange(2010, 2100, 10)
-
-cmap_dec = plt.get_cmap("Spectral_r", len(bins_dec) - 1).copy()
-cmap_dec.set_bad(NO_DATA_COLOR)      # NaN -> white
-cmap_dec.set_under(NO_CHANGE_COLOR)  # <vmin -> grey
-norm_dec = BoundaryNorm(bins_dec, cmap_dec.N, clip=False)
-
-# no exceedance by 2100 -> map to <2010 so it shows as GREY ("under")
-foe_dec_370_plot = foe_dec_370.where(np.isfinite(foe_dec_370), 2000.0)
-foe_dec_585_plot = foe_dec_585.where(np.isfinite(foe_dec_585), 2000.0)
-
-plot_pair_bottom_cbar(
-    foe_dec_370_plot,
-    foe_dec_585_plot,
-    title=f"{PLOT_INDEX.upper()}: First exceedance decade",
-    cmap=cmap_dec,
-    norm=norm_dec,
-    cbar_label="First exceedance decade (grey = none by 2100; white = no data)",
-    ticks=ticks_dec,
-    ticklabels=[str(t) for t in ticks_dec],
-)
-
-# 2) Magnitude z-score (grey=0, white=NaN)
-cmap_z = plt.get_cmap("viridis").copy()
-cmap_z.set_bad(NO_DATA_COLOR)
-cmap_z.set_under(NO_CHANGE_COLOR)
-norm_z = Normalize(vmin=EPS, vmax=z_vmax, clip=True)
-
-plot_pair_bottom_cbar(
-    zmag_370,
-    zmag_585,
-    title=f"{PLOT_INDEX.upper()}: Max standardised exceedance magnitude (z-score)",
-    cmap=cmap_z,
-    norm=norm_z,
-    cbar_label="Max standardised exceedance (σ units)  [grey = 0; white = no data]",
-    ticks=[0, 2, 4, 6, 8, 10, z_vmax],
-    ticklabels=["0", "2", "4", "6", "8", "10", f"{z_vmax:.0f}"],
-)
-
-# 3) Persistence (integer years; grey=0, white=NaN)
-cmap_pers = plt.get_cmap("plasma").copy()
-cmap_pers.set_bad(NO_DATA_COLOR)
-cmap_pers.set_under(NO_CHANGE_COLOR)
-
-finite_p = np.concatenate([
-    persist_370.values[np.isfinite(persist_370.values)],
-    persist_585.values[np.isfinite(persist_585.values)],
-])
-p_vmax = float(np.nanmax(finite_p)) if finite_p.size else 1.0
-p_vmax = max(p_vmax, 1.0)
-
-norm_pers = Normalize(vmin=0.5, vmax=p_vmax, clip=True)  # 0 goes to "under" grey
-
-ticks_p = [0, 1, 2, 3, 5, 10] + ([p_vmax] if p_vmax not in [0,1,2,3,5,10] else [])
-ticks_p = [t for t in ticks_p if t <= p_vmax]
-ticklabels_p = [str(int(t)) for t in ticks_p]
-
-plot_pair_bottom_cbar(
-    persist_370.astype("float32"),
-    persist_585.astype("float32"),
-    title=f"{PLOT_INDEX.upper()}: Persistence (longest consecutive exceedance run, years)",
-    cmap=cmap_pers,
-    norm=norm_pers,
-    cbar_label="Persistence (years)  [grey = 0; white = no data]",
-    ticks=ticks_p,
-    ticklabels=ticklabels_p,
-)
-
 print("\nDONE ✅")
 print(f"Outputs saved:\n- NetCDF: {OUT_NC}\n- CSV: {OUT_CSV}")
-
-Add rainfall analysis script
+print(
+    "Suggested plot scales (for R):\n"
+    f"- z_vmax (percentile={Z_VMAX_PERCENTILE}): {z_vmax:.2f}\n"
+    f"- persistence vmax: {p_vmax:.0f}"
+)
